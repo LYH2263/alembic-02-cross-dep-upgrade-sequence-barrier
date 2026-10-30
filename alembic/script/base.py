@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from .revision import _GetRevArg
     from .revision import _RevIdType
     from .revision import Revision
+    from .revision import VersionRowState
     from ..config import Config
     from ..config import MessagingOptions
     from ..config import PostWriteHookConfig
@@ -376,6 +378,51 @@ class ScriptDirectory:
         if consider_depends_on:
             return list(self.revision_map._real_heads)
         return list(self.revision_map.heads)
+
+    def get_versioned_heads(self) -> list[str]:
+        """Return heads of the version-edge (``down_revision``) graph.
+
+        Cross-branch ``depends_on`` edges are not counted; a revision
+        consumed only through a ``depends_on`` edge still appears.  This
+        is the head list used for display purposes and is deliberately a
+        different answer from :meth:`.get_dependency_heads` and from the
+        live ``alembic_version`` row set.
+
+        .. versionadded:: 1.21
+
+        .. seealso:: :meth:`.ScriptDirectory.get_dependency_heads`
+
+        """
+        return list(self.revision_map.versioned_heads)
+
+    def get_dependency_heads(self) -> list[str]:
+        """Return heads once cross-branch ``depends_on`` edges are counted.
+
+        This is an answer about the *script graph*; it must not be
+        substituted for the rows actually present in
+        ``alembic_version`` -- use
+        :meth:`.ScriptDirectory.classify_version_rows` for that.
+
+        .. versionadded:: 1.21
+
+        .. seealso:: :meth:`.ScriptDirectory.get_versioned_heads`
+
+        """
+        return list(self.revision_map.dependency_heads)
+
+    def classify_version_rows(self, row_ids: Iterable[str]) -> VersionRowState:
+        """Classify a live ``alembic_version`` row set against this graph.
+
+        Returns the :class:`.VersionRowState` describing which present
+        rows are effective tips (``depends_on`` counted), which are stale
+        and which are unknown.  Distinct from both
+        :meth:`.get_versioned_heads` and :meth:`.get_dependency_heads`,
+        which only describe the script graph.
+
+        .. versionadded:: 1.21
+
+        """
+        return self.revision_map.classify_version_rows(row_ids)
 
     def get_base(self) -> str | None:
         """Return the "base" revision as a string.

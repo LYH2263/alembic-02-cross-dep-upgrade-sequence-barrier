@@ -698,10 +698,153 @@ class MigrationContext:
             return None
 
 
+class VersionRowChange:
+    """One concrete row mutation against the ``alembic_version`` table.
+
+    A single revision step can imply several row mutations when
+    ``depends_on`` edges cross branches (multi-row merge / unmerge).
+    Such a step is therefore represented by a *sequence* of
+    :class:`.VersionRowChange` objects (delete+update for a merge,
+    insert+update for an unmerge) instead of being collapsed into one
+    scalar UPDATE; the sequence is testably different both in length and
+    in the SQL it emits.
+
+    .. versionadded:: 1.21
+
+    """
+
+    INSERT = "insert"
+    DELETE = "delete"
+    UPDATE = "update"
+
+    __slots__ = ("kind", "value", "from_value")
+
+    def __init__(
+        self,
+        kind: str,
+        value: str,
+        from_value: str | None = None,
+    ) -> None:
+        self.kind = kind
+        """One of :attr:`.INSERT`, :attr:`.DELETE`, :attr:`.UPDATE`."""
+
+        self.value = value
+        """For insert/delete: the affected revision id.  For update: the
+        new revision id."""
+
+        self.from_value = from_value
+        """For update: the revision id being replaced; None otherwise."""
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, VersionRowChange)
+            and other.kind == self.kind
+            and other.value == self.value
+            and other.from_value == self.from_value
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.kind, self.value, self.from_value))
+
+    def __repr__(self) -> str:
+        if self.kind == self.UPDATE:
+            return (
+                "VersionRowChange(%r, %r -> %r)"
+                % (self.kind, self.from_value, self.value)
+            )
+        return "VersionRowChange(%r, %r)" % (self.kind, self.value)
+
+
+def plan_version_row_changes(
+    step: RevisionStep | StampStep, heads: Collection[str]
+) -> tuple[VersionRowChange, ...]:
+    """Plan the ``alembic_version`` row mutations for one step.
+
+    The decision is taken against the **currently present** head set and
+    uses the exact branch delete/create/merge/unmerge dispatch that the
+    single-shot migration runner uses, so the per-step sequence stays
+    observably identical to the pin for every individual step -- while
+    making it explicit that a cross-branch ``depends_on`` step can yield
+    multiple row changes rather than one scalar UPDATE.
+
+    .. versionadded:: 1.21
+
+    """
+    current_heads = set(heads)
+    if step.should_delete_branch(current_heads):
+        return (
+            VersionRowChange(
+                VersionRowChange.DELETE, step.delete_version_num
+            ),
+        )
+    elif step.should_create_branch(current_heads):
+        return (
+            VersionRowChange(
+                VersionRowChange.INSERT, step.insert_version_num
+            ),
+        )
+    elif step.should_merge_branches(current_heads):
+        # delete revs, update from rev, update to rev
+        (
+            delete_revs,
+            update_from_rev,
+            update_to_rev,
+        ) = step.merge_branch_idents(current_heads)
+        return tuple(
+            [
+                VersionRowChange(VersionRowChange.DELETE, delrev)
+                for delrev in delete_revs
+            ]
+            + [
+                VersionRowChange(
+                    VersionRowChange.UPDATE,
+                    update_to_rev,
+                    update_from_rev,
+                )
+            ]
+        )
+    elif step.should_unmerge_branches(current_heads):
+        (
+            update_from_rev,
+            update_to_rev,
+            insert_revs,
+        ) = step.unmerge_branch_idents(current_heads)
+        return tuple(
+            [
+                VersionRowChange(VersionRowChange.INSERT, insrev)
+                for insrev in insert_revs
+            ]
+            + [
+                VersionRowChange(
+                    VersionRowChange.UPDATE,
+                    update_to_rev,
+                    update_from_rev,
+                )
+            ]
+        )
+    else:
+        from_, to_ = step.update_version_num(current_heads)
+        return (VersionRowChange(VersionRowChange.UPDATE, to_, from_),)
+
+
 class HeadMaintainer:
     def __init__(self, context: MigrationContext, heads: Any) -> None:
         self.context = context
         self.heads = set(heads)
+
+    def _apply_row_changes(
+        self, changes: Iterable[VersionRowChange]
+    ) -> None:
+        for change in changes:
+            if change.kind == VersionRowChange.INSERT:
+                self._insert_version(change.value)
+            elif change.kind == VersionRowChange.DELETE:
+                self._delete_version(change.value)
+            else:
+                assert change.from_value is not None
+                self._update_version(
+                    change.from_value, change.value
+                )
 
     def _insert_version(self, version: str) -> None:
         assert version not in self.heads
@@ -764,49 +907,58 @@ class HeadMaintainer:
             )
 
     def update_to_step(self, step: RevisionStep | StampStep) -> None:
-        if step.should_delete_branch(self.heads):
-            vers = step.delete_version_num
-            log.debug("branch delete %s", vers)
-            self._delete_version(vers)
-        elif step.should_create_branch(self.heads):
-            vers = step.insert_version_num
-            log.debug("new branch insert %s", vers)
-            self._insert_version(vers)
-        elif step.should_merge_branches(self.heads):
-            # delete revs, update from rev, update to rev
-            (
-                delete_revs,
-                update_from_rev,
-                update_to_rev,
-            ) = step.merge_branch_idents(self.heads)
-            log.debug(
-                "merge, delete %s, update %s to %s",
-                delete_revs,
-                update_from_rev,
-                update_to_rev,
-            )
-            for delrev in delete_revs:
-                self._delete_version(delrev)
-            self._update_version(update_from_rev, update_to_rev)
-        elif step.should_unmerge_branches(self.heads):
-            (
-                update_from_rev,
-                update_to_rev,
-                insert_revs,
-            ) = step.unmerge_branch_idents(self.heads)
-            log.debug(
-                "unmerge, insert %s, update %s to %s",
-                insert_revs,
-                update_from_rev,
-                update_to_rev,
-            )
-            for insrev in insert_revs:
-                self._insert_version(insrev)
-            self._update_version(update_from_rev, update_to_rev)
-        else:
-            from_, to_ = step.update_version_num(self.heads)
-            log.debug("update %s to %s", from_, to_)
-            self._update_version(from_, to_)
+        # the dispatch lives in plan_version_row_changes so that a
+        # stepwise sequence observes exactly the same insert/delete/update
+        # decisions as a single-shot run, while still executing the row
+        # mutations here in their planned order
+        changes = plan_version_row_changes(step, self.heads)
+        log.debug(
+            "version row changes for %s: %s", step.short_log, changes
+        )
+        self._apply_row_changes(changes)
+
+
+class StepwiseVersionMaintainer(HeadMaintainer):
+    """A :class:`.HeadMaintainer` that re-reads the live version table
+    before every step.
+
+    Unlike the single-shot runner, which snapshots the current heads once
+    at run start, :meth:`.refresh` reloads the rows actually present at
+    each step boundary and :meth:`.apply` both plans and performs the row
+    mutations against that fresh set, returning the
+    :class:`.VersionRowChange` objects executed.  This is the carrier that
+    lets later steps of a host sequence see -- and resolve targets
+    against -- the rows an earlier step just wrote, including multi-row
+    cross-branch ``depends_on`` merges/unmerges.
+
+    .. versionadded:: 1.21
+
+    """
+
+    def __init__(self, context: MigrationContext) -> None:
+        super().__init__(context, ())
+
+    def refresh(self) -> set[str]:
+        """Reload the live ``alembic_version`` rows into ``self.heads``
+        and return the new head set."""
+
+        self.heads = set(self.context.get_current_heads())
+        return set(self.heads)
+
+    def apply(
+        self, step: RevisionStep | StampStep
+    ) -> tuple[VersionRowChange, ...]:
+        """Run the planned version table mutations for ``step`` against
+        the most recently refreshed head set and return them."""
+
+        changes = plan_version_row_changes(step, self.heads)
+        log.debug(
+            "stepwise version row changes for %s: %s",
+            step.short_log,
+            changes,
+        )
+        self._apply_row_changes(changes)
+        return changes
 
 
 class MigrationInfo:

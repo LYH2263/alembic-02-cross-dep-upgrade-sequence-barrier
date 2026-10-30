@@ -118,6 +118,69 @@ class DependencyLoopDetected(DependencyCycleDetected, LoopDetected):
         super().__init__(revision)
 
 
+class VersionRowState:
+    """Structural classification of a live ``alembic_version`` row set.
+
+    This is a *third* answer, distinct both from the script-directory head
+    list that ignores ``depends_on`` edges and from the head list that
+    counts dependency edges: it describes the rows actually present in the
+    version table at one instant.
+
+    Given the rows that are present, the ancestor closure over
+    **all** edges (version edges plus resolved ``depends_on`` edges)
+    determines which present rows are effective tips; a present row that
+    is implied as an ancestor (including as a cross-branch dependency) of
+    another present row is a stale row.  A row set that a subsequent
+    ``upgrade heads`` can continue from contains effective tips only.
+
+    .. versionadded:: 1.21
+
+    """
+
+    __slots__ = ("rows", "effective_tips", "stale_rows", "unknown_rows")
+
+    def __init__(
+        self,
+        rows: tuple[str, ...],
+        effective_tips: tuple[str, ...],
+        stale_rows: tuple[str, ...],
+        unknown_rows: tuple[str, ...],
+    ) -> None:
+        self.rows = rows
+        """tuple of every revision id present as a version table row."""
+
+        self.effective_tips = effective_tips
+        """present rows that remain tips once ``depends_on`` edges are
+        counted; this is what another ``upgrade`` step would resolve its
+        target against."""
+
+        self.stale_rows = stale_rows
+        """present rows already implied by another present row through an
+        ancestor or cross-branch dependency edge."""
+
+        self.unknown_rows = unknown_rows
+        """present rows that do not exist in the script directory at all."""
+
+    @property
+    def is_effective_head_state(self) -> bool:
+        """True if the row set is a valid state from which upgrading
+        towards the script-directory heads can continue."""
+
+        return not self.stale_rows and not self.unknown_rows
+
+    def __repr__(self) -> str:
+        return (
+            "VersionRowState(rows=%r, effective_tips=%r, stale_rows=%r, "
+            "unknown_rows=%r)"
+            % (
+                self.rows,
+                self.effective_tips,
+                self.stale_rows,
+                self.unknown_rows,
+            )
+        )
+
+
 class RevisionMap:
     """Maintains a map of :class:`.Revision` objects.
 
@@ -473,6 +536,102 @@ class RevisionMap:
                     [revision.revision]
                 )
             ) + (revision.revision,)
+
+    @property
+    def versioned_heads(self) -> tuple[str, ...]:
+        """Head revisions looking at version (``down_revision``) edges
+        only.
+
+        Cross-branch ``depends_on`` edges are deliberately **not** counted
+        here: a revision whose only reason for being consumed is a
+        ``depends_on`` edge on another branch still shows up as a head.
+        This is the answer used for display / listing ("what heads does
+        the script directory have?").
+
+        .. versionadded:: 1.21
+
+        """
+        return self.heads
+
+    @property
+    def dependency_heads(self) -> tuple[str, ...]:
+        """Head revisions once cross-branch ``depends_on`` edges are
+        counted.
+
+        A revision that is referenced through a ``depends_on`` edge is no
+        longer a head here, even though that edge is not a
+        ``down_revision`` version edge.  This matches the effective tips
+        a fully upgraded ``alembic_version`` table converges to, but it is
+        still an answer about the *script graph* -- never about the live
+        table rows; for the latter use
+        :meth:`.RevisionMap.classify_version_rows`.
+
+        .. versionadded:: 1.21
+
+        """
+        return self._real_heads
+
+    def classify_version_rows(
+        self, row_ids: Iterable[str | None]
+    ) -> VersionRowState:
+        """Classify the rows actually present in ``alembic_version``.
+
+        Unlike :attr:`.versioned_heads` / :attr:`.dependency_heads`, this
+        is an answer about a *live row set*, not about the script graph.
+        It computes, for a given row set, which rows are effective tips
+        once ancestor and ``depends_on`` edges are both counted, which
+        rows are stale (already implied by another present row), and
+        which rows are unknown to the script directory.  Sequence step
+        boundaries use this to refuse leaving the version table in a
+        state from which ``upgrade heads`` could not continue.
+
+        .. versionadded:: 1.21
+
+        """
+        revision_map = self._revision_map
+
+        # de-duplicate while preserving order; the version table PK does
+        # this in practice, the method stays pure w.r.t. its argument.
+        rows: tuple[str, ...] = tuple(
+            dict.fromkeys(
+                row_id for row_id in row_ids if row_id is not None
+            )
+        )
+
+        present_revisions: list[Revision] = []
+        unknown_rows: list[str] = []
+        for row_id in rows:
+            revision = revision_map.get(row_id)
+            if revision is None:
+                unknown_rows.append(row_id)
+            else:
+                present_revisions.append(revision)
+
+        # the ancestor closure over ALL edges: version edges plus
+        # resolved cross-branch depends_on edges.
+        closure = set(
+            self._get_ancestor_nodes(
+                present_revisions, include_dependencies=True, check=False
+            )
+        )
+        closure.update(present_revisions)
+        closure_ids = {revision.revision for revision in closure}
+
+        effective_tips = [
+            revision.revision
+            for revision in closure
+            if not set(revision._all_nextrev).intersection(closure_ids)
+        ]
+
+        row_set = set(rows)
+        stale_rows = row_set.difference(effective_tips).difference(unknown_rows)
+
+        return VersionRowState(
+            rows=rows,
+            effective_tips=tuple(sorted(effective_tips)),
+            stale_rows=tuple(sorted(stale_rows)),
+            unknown_rows=tuple(sorted(unknown_rows)),
+        )
 
     def get_current_head(self, branch_label: str | None = None) -> str | None:
         """Return the current head revision.
